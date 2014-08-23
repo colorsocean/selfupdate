@@ -1,15 +1,27 @@
 package selfupdate
 
 import (
+	"archive/zip"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
 
 	"bitbucket.org/kardianos/osext"
-	"github.com/Sirupsen/logrus"
+
+	. "github.com/colorsocean/selfupdate"
+	. "github.com/colorsocean/selfupdate/common"
 )
+
+const ()
+
+var ()
+
+func init() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+}
 
 type uptool struct {
 	UpdateDir string
@@ -24,7 +36,6 @@ type uptool struct {
 	issuerExeBackup string
 
 	logFile *os.File
-	Log     *logrus.Logger
 }
 
 func (this *uptool) WaitRemoveTarget(d time.Duration) (deleted bool) {
@@ -99,17 +110,6 @@ func UpTool() *uptool {
 	ut.logFile, err = os.Create(ut.logFilePath)
 	panicOn(err)
 
-	ut.Log = logrus.New()
-	ut.Log.Out = ut.logFile
-	ut.Log.Level = logrus.DebugLevel
-	ut.Log.Hooks.Add(&SimpleLogrusHook{
-		func(entry *logrus.Entry) {
-			entry.Data["emmiter"] = "application"
-			entry.Data["name"] = "uptool"
-			entry.Data["pid"] = os.Getpid()
-		},
-	})
-
 	err = decodeFrom(&ut.info, ut.infoFilePath)
 	panicOn(err)
 
@@ -119,4 +119,45 @@ func UpTool() *uptool {
 	ut.IssuerExe = ut.info.IssuerExe
 
 	return ut
+}
+
+func unzip(archivePath, targetDir string) error {
+	zipReader, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return err
+	}
+	defer zipReader.Close()
+
+	for _, file := range zipReader.File {
+		filePath := filepath.Join(targetDir, file.Name)
+
+		if file.FileInfo().IsDir() {
+			os.MkdirAll(filePath, file.Mode())
+		} else {
+			reader, err := file.Open()
+			if err != nil {
+				return err
+			}
+			defer reader.Close()
+
+			fileDir, _ := filepath.Split(filePath)
+			err = os.MkdirAll(fileDir, file.Mode())
+			if err != nil {
+				return err
+			}
+
+			writer, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+			if err != nil {
+				return err
+			}
+			defer writer.Close()
+
+			_, err = io.Copy(writer, reader)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }

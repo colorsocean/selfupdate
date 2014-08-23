@@ -1,39 +1,70 @@
+//
+//
 package selfupdate
+
+// todo: [ ] Reduce amount of stored data, replace with calculations
+// todo: [ ] Prevent simulateous update attempts
+// todo: [ ] Make Version accept letters
 
 import (
 	"archive/zip"
-	"bytes"
-	"encoding/gob"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"time"
-
 	"bitbucket.org/kardianos/osext"
+
 	"github.com/Sirupsen/logrus"
+	. "github.com/colorsocean/selfupdate/common"
 )
 
 var (
-	app appData
+	env SelfupdateEnv
+
+	ErrNoUptoolExe = errors.New("Missing uptool executable in update archive")
+)
+
+type SelfupdateEnv struct {
+	IssuerVersion     Version
+	MaxUpdateAttempts int
+
 	log *logrus.Logger
-)
+}
 
-const (
-	selfupdateInfoFileExt = ".selfupdate"
-	uptoolInfoFileName    = "selfupdate"
-	uptoolImageName       = "uptool"
-	updateArchiveFileName = "update.zip"
-	selfupdateDirName     = "selfupdate"
-	updateExtractDirName  = "update"
+func (this SelfupdateEnv) IssuerExe() string {
+	exe, err = osext.Executable()
+	PanicOn(err)
+	return exe
+}
 
-	fileTsFormat = "2006-01-02T15-04-05-999999999Z0700"
-)
+func (this SelfupdateEnv) IssuerDir() string {
+	dir, _ = filepath.Split(this.IssuerExe())
+	return dir
+}
+
+func (this SelfupdateEnv) IssuerName() string {
+	_, name = filepath.Split(this.IssuerExe())
+	return TrimExeExt(name)
+}
+
+func (this SelfupdateEnv) SelfupdateInfoPath() string {
+	return TrimExeExt(this.IssuerExe()) + SelfupdateInfoExt
+}
+
+func (this SelfupdateEnv) TargetDir() string {
+	return this.IssuerDir()
+}
+
+func (this SelfupdateEnv) UpdatesCacheDir() string {
+	return filepath.Join(this.TargetDir(), UpdatesCacheDirName)
+}
+
+func (this SelfupdateEnv) UpdateDir(ver Version) string {
+	return filepath.Join(this.UpdatesCacheDir(), fmt.Sprintf("%s-%s", this.IssuerName(), ver))
+}
 
 /****************************************************************
 ** Types
@@ -44,58 +75,17 @@ type Options struct {
 	MaxUpdateAttempts int
 }
 
-type appData struct {
-	Ops Options
-
-	SelfDir       string
-	SelfPath      string
-	SelfNameNoExt string
-	SelfName      string
-
-	SelfupdateInfoFilePath string
-
-	UptoolImageFileName string
-}
-
-// todo: Reduce amount of stored data, replace with calculations
-type selfupdateInfo struct {
-	UpdateDir          string
-	UpdateExtractDir   string
-	UpdateArchivePath  string
-	UptoolPath         string
-	UptoolInfoFilePath string
-	UptoolExtractPath  string
-	IssuerVersion      Version
-	UpdateVersion      Version
-	UpdateAttempt      int
-
-	RunAfterUpdate bool
-
-	updateArchiveFile *os.File
-}
-
-type uptoolInfo struct {
-	IssuerDir              string
-	IssuerExe              string
-	IssuerVersion          Version
-	UpdateVersion          Version
-	RunAfterUpdate         bool
-	SelfupdateInfoFilePath string
-}
-
 /****************************************************************
 ** Logic
 ********/
 
 func Init(options Options) func() {
-	app = appData{
-		Ops: options,
-	}
+	env = SelfupdateEnv{}
 
-	log = logrus.New()
-	log.Out = os.Stderr
-	log.Level = logrus.DebugLevel
-	log.Hooks.Add(&SimpleLogrusHook{
+	env.log = logrus.New()
+	env.log.Out = os.Stderr
+	env.log.Level = logrus.DebugLevel
+	env.log.Hooks.Add(&simpleLogrusHook{
 		func(entry *logrus.Entry) {
 			entry.Data["emmiter"] = "module"
 			entry.Data["name"] = "selfupdate"
@@ -105,28 +95,11 @@ func Init(options Options) func() {
 
 	var err error
 
-	app.SelfDir, err = osext.ExecutableFolder()
-	panicOn(err)
-	app.SelfPath, err = osext.Executable()
-	panicOn(err)
-
-	app.SelfName = strings.TrimPrefix(app.SelfPath, app.SelfDir)
-	app.SelfNameNoExt = strings.TrimSuffix(app.SelfName, ".exe")
-
-	app.SelfupdateInfoFilePath = filepath.Join(app.SelfDir, fmt.Sprintf("%s%s", app.SelfNameNoExt, selfupdateInfoFileExt))
-
-	app.UptoolImageFileName = uptoolImageName
-	if runtime.GOOS == "windows" {
-		app.UptoolImageFileName += ".exe"
+	env.IssuerVersion = options.Version
+	env.MaxUpdateAttempts = options.MaxUpdateAttempts
+	if env.MaxUpdateAttempts <= 0 {
+		env.MaxUpdateAttempts = 3
 	}
-
-	//exeExtIfAny := ""
-	//if strings.HasSuffix(selfPath, ".exe") {
-	//	exeExtIfAny = ".exe"
-	//}
-	//selfupdateFileName = filepath.Join(selfDir, fmt.Sprintf("%s%s", selfNameNoExt, exeExtIfAny))
-
-	log.Debugln("options:", getJson(app))
 
 	if checkUpdateReady() {
 		os.Exit(0)
@@ -139,77 +112,67 @@ func Init(options Options) func() {
 
 func checkUpdateReady() (mustExit bool) {
 	si := &selfupdateInfo{}
-	err := decodeFrom(si, app.SelfupdateInfoFilePath)
+	err := DecodeFrom(si, env.SelfupdateInfoFilePath)
 	if os.IsNotExist(err) {
 		return false
 	}
 
-	if si.UpdateAttempt >= app.Ops.MaxUpdateAttempts {
-		os.Remove(app.SelfupdateInfoFilePath)
+	if si.UpdateAttempt >= env.Ops.MaxUpdateAttempts {
+		os.Remove(env.SelfupdateInfoFilePath)
 		cleanupSelfupdate(si)
 		return false
 	}
 
 	si.UpdateAttempt++
-	err = encodeTo(si, app.SelfupdateInfoFilePath)
-	panicOn(err)
+	err = EncodeTo(si, env.SelfupdateInfoFilePath)
+	PanicOn(err)
 
 	err = exec.Command(si.UptoolPath).Start()
-	panicOn(err)
+	PanicOn(err)
 
 	return true
 }
 
-func prepareSelfupdate(version Version, autoStart bool) (si *selfupdateInfo, err error) {
-	si = &selfupdateInfo{}
-	si.UpdateDir = generateUpdateDir()
-	si.UpdateExtractDir = filepath.Join(si.UpdateDir, updateExtractDirName)
-	si.UpdateArchivePath = filepath.Join(si.UpdateDir, updateArchiveFileName)
-	si.UptoolExtractPath = filepath.Join(si.UpdateExtractDir, app.UptoolImageFileName)
-	si.UptoolPath = filepath.Join(si.UpdateDir, app.UptoolImageFileName)
-	si.UptoolInfoFilePath = filepath.Join(si.UpdateDir, uptoolInfoFileName)
-
-	si.IssuerVersion = app.Ops.Version
+func prepareSelfupdate(version Version, autoStart bool) (si *selfupdateInfo, f *os.File, err error) {
+	si = &SelfupdateInfo{}
+	si.UpdateDir = env.UpdateDir(version)
 	si.UpdateVersion = version
-	si.RunAfterUpdate = autoStart
+	si.IssuerVersion = env.IssuerVersion
+	si.StartAfterUpdate = autoStart
 
-	err = os.MkdirAll(si.UpdateExtractDir, 0)
+	err = os.MkdirAll(si.UpdateDir, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	si.updateArchiveFile, err = os.Create(si.UpdateArchivePath)
+	f, err = os.Create(si.UpdateArchivePath())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return si, nil
+	return si, f, nil
 }
 
 func continueSelfupdate(si *selfupdateInfo) error {
-	err := unzip(si.UpdateArchivePath, si.UpdateExtractDir)
-	if err != nil {
-		return err
-	}
-	err = os.Rename(si.UptoolExtractPath, si.UptoolPath)
+	err := extractUptool(si)
 	if err != nil {
 		return err
 	}
 
-	err = encodeTo(si, app.SelfupdateInfoFilePath)
+	err = EncodeTo(si, env.SelfupdateInfoPath())
 	if err != nil {
 		return err
 	}
 
-	uti := &uptoolInfo{}
-	uti.IssuerDir = app.SelfDir
-	uti.IssuerExe = app.SelfPath
+	uti := &UptoolInfo{}
+	uti.IssuerDir = env.SelfDir
+	uti.IssuerExe = env.SelfPath
 	uti.IssuerVersion = si.IssuerVersion
 	uti.UpdateVersion = si.UpdateVersion
-	uti.SelfupdateInfoFilePath = app.SelfupdateInfoFilePath
+	uti.SelfupdateInfoFilePath = env.SelfupdateInfoFilePath
 	uti.RunAfterUpdate = si.RunAfterUpdate
 
-	err = encodeTo(uti, si.UptoolInfoFilePath)
+	err = EncodeTo(uti, si.UptoolInfoPath())
 	if err != nil {
 		return err
 	}
@@ -230,11 +193,12 @@ func cleanupSelfupdate(si *selfupdateInfo) error {
 ********/
 
 type updateWriteCloser struct {
-	si *selfupdateInfo
+	si *SelfupdateInfo
+	f  *os.File
 }
 
 func (this *updateWriteCloser) Write(p []byte) (n int, err error) {
-	n, err = this.si.updateArchiveFile.Write(p)
+	n, err = this.f.updateArchiveFile.Write(p)
 	if err != nil {
 		cleanupSelfupdate(this.si)
 		return
@@ -243,7 +207,7 @@ func (this *updateWriteCloser) Write(p []byte) (n int, err error) {
 }
 
 func (this *updateWriteCloser) Close() (err error) {
-	err = this.si.updateArchiveFile.Close()
+	err = this.f.updateArchiveFile.Close()
 	if err != nil {
 		cleanupSelfupdate(this.si)
 		return
@@ -259,12 +223,12 @@ func (this *updateWriteCloser) Close() (err error) {
 }
 
 func ViaWriteCloser(version Version, autoStart bool) (io.WriteCloser, error) {
-	si, err := prepareSelfupdate(version, autoStart)
+	si, f, err := prepareSelfupdate(version, autoStart)
 	if err != nil {
 		cleanupSelfupdate(si)
 		return nil, err
 	}
-	w := &updateWriteCloser{si}
+	w := &updateWriteCloser{si, f}
 	return w, nil
 }
 
@@ -272,105 +236,37 @@ func ViaWriteCloser(version Version, autoStart bool) (io.WriteCloser, error) {
 ** Utils
 ********/
 
-func panicOn(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
-
-func getJson(v interface{}) string {
-	result, _ := json.MarshalIndent(v, "", "  ")
-	return string(result)
-}
-
 func generateUpdateDir() string {
-	return filepath.Join(app.SelfDir, selfupdateDirName,
-		fmt.Sprintf("%s-%s", app.SelfNameNoExt, time.Now().UTC().Format(fileTsFormat)))
+	return filepath.Join(env.SelfDir, selfupdateDirName,
+		fmt.Sprintf("%s-%s", env.SelfNameNoExt, time.Now().UTC().Format(fileTsFormat)))
 }
 
 func getSelfupdateInfoFilePath() string {
-	return filepath.Join(app.SelfDir, fmt.Sprintf("%s%s", app.SelfNameNoExt, selfupdateInfoFileExt))
+	return filepath.Join(env.SelfDir, fmt.Sprintf("%s%s", env.SelfNameNoExt, selfupdateInfoFileExt))
 }
 
-func encodeTo(v interface{}, fileName string) error {
-	data := encode(v)
-	err := ioutil.WriteFile(fileName, data, 0)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func decodeFrom(v interface{}, fileName string) error {
-	data, err := ioutil.ReadFile(fileName)
-	if err != nil {
-		return err
-	}
-	decode(v, data)
-	return nil
-}
-
-func encode(v interface{}) []byte {
-	buffer := new(bytes.Buffer)
-	encoder := gob.NewEncoder(buffer)
-	err := encoder.Encode(v)
-	panicOn(err)
-	return buffer.Bytes()
-}
-
-func decode(v interface{}, data []byte) {
-	buffer := bytes.NewBuffer(data)
-	decoder := gob.NewDecoder(buffer)
-	err := decoder.Decode(v)
-	panicOn(err)
-}
-
-func unzip(archivePath, targetDir string) error {
-	zipReader, err := zip.OpenReader(archivePath)
+func extractUptool(si *SelfupdateInfo) error {
+	zipReader, err := zip.OpenReader(si.UpdateArchivePath())
 	if err != nil {
 		return err
 	}
 	defer zipReader.Close()
 
+	uptoolName := EnsureExeExt(UptoolExeName)
 	for _, file := range zipReader.File {
-		filePath := filepath.Join(targetDir, file.Name)
-
-		if file.FileInfo().IsDir() {
-			os.MkdirAll(filePath, file.Mode())
-		} else {
-			reader, err := file.Open()
-			if err != nil {
-				return err
-			}
-			defer reader.Close()
-
-			fileDir, _ := filepath.Split(filePath)
-			err = os.MkdirAll(fileDir, file.Mode())
-			if err != nil {
-				return err
-			}
-
-			writer, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
-			if err != nil {
-				return err
-			}
-			defer writer.Close()
-
-			_, err = io.Copy(writer, reader)
-			if err != nil {
-				return err
-			}
+		if file.Name == uptoolName {
+			return ExtractOne(file, si.UptoolPath())
 		}
 	}
 
-	return nil
+	return ErrNoUptoolExe
 }
 
-type SimpleLogrusHook struct {
+type simpleLogrusHook struct {
 	OnFire func(*logrus.Entry)
 }
 
-func (this *SimpleLogrusHook) Levels() []logrus.Level {
+func (this *simpleLogrusHook) Levels() []logrus.Level {
 	return []logrus.Level{
 		logrus.PanicLevel,
 		logrus.FatalLevel,
@@ -381,7 +277,7 @@ func (this *SimpleLogrusHook) Levels() []logrus.Level {
 	}
 }
 
-func (this *SimpleLogrusHook) Fire(entry *logrus.Entry) error {
+func (this *simpleLogrusHook) Fire(entry *logrus.Entry) error {
 	this.OnFire(entry)
 	return nil
 }
