@@ -21,3 +21,5 @@ _testmain.go
 
 *.exe
 *.test
+*.zip
+test/test.exe.bak
