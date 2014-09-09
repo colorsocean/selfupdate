@@ -2,7 +2,6 @@ package selfupdate
 
 import (
 	"archive/zip"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -11,153 +10,172 @@ import (
 
 	"bitbucket.org/kardianos/osext"
 
-	. "github.com/colorsocean/selfupdate"
 	. "github.com/colorsocean/selfupdate/common"
 )
 
 const ()
 
-var ()
+var (
+	env = uptoolEnv{}
+)
 
-func init() {
-	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
-}
+type uptoolEnv struct {
+	UptoolInfo
 
-type uptool struct {
-	UpdateDir string
-	IssuerExe string
-
-	selfDir      string
-	selfExe      string
-	infoFilePath string
-	logFilePath  string
-	info         uptoolInfo
-
-	issuerExeBackup string
+	IssuerExeIsAService bool
+	IssuerExeDeleted    bool
+	Done                bool
 
 	logFile *os.File
 }
 
-func (this *uptool) WaitRemoveTarget(d time.Duration) (deleted bool) {
+func (this uptoolEnv) SelfExe() string {
+	exe, err := osext.Executable()
+	PanicOn(err)
+	return exe
+}
+
+func (this uptoolEnv) SelfDir() string {
+	dir, _ := filepath.Split(this.SelfExe())
+	return dir
+}
+
+func (this uptoolEnv) UptoolInfoPath() string {
+	return filepath.Join(this.SelfDir(), UptoolInfoName)
+}
+
+func (this uptoolEnv) UptoolLogPath() string {
+	return filepath.Join(this.SelfDir(), UptoolLogName)
+}
+
+func (this uptoolEnv) UpdateArchivePath() string {
+	return filepath.Join(this.SelfDir(), UpdateArchiveName)
+}
+
+func init() {
+	var err error
+	env.logFile, err = os.Create(env.UptoolLogPath())
+	PanicOn(err)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+	log.SetOutput(env.logFile)
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Println("Error initializing uptool", rec)
+		}
+	}()
+	err = DecodeFrom(&env.UptoolInfo, env.UptoolInfoPath())
+	PanicOn(err)
+	log.Println("Uptool started")
+}
+
+func done() {
+	env.Done = true
+	if env.IssuerExeDeleted {
+		err := os.Remove(env.IssuerExeBak())
+		if err != nil {
+			log.Println("Warning:", err.Error())
+		}
+	}
+
+	err := os.Remove(env.SelfupdateInfoPath())
+	PanicOn(err)
+
+	finally()
+	os.Exit(0)
+}
+
+func failure() {
+	if env.IssuerExeDeleted {
+		err := os.Rename(env.IssuerExeBak(), env.IssuerExe)
+		PanicOn(err)
+	}
+
+	finally()
+	os.Exit(1)
+}
+
+func finally() {
+	if env.StartAfterUpdate {
+		if env.IssuerExeIsAService {
+			err := exec.Command(env.IssuerExe, "start").Run()
+			PanicOn(err)
+		} else {
+			err := exec.Command(env.IssuerExe).Start()
+			PanicOn(err)
+		}
+	}
+}
+
+func Recover() {
+	if rec := recover(); rec != nil {
+		log.Println("Uptool failed, preparing simple rollback. Message:", rec)
+		if env.Done {
+			log.Println("Failure after Done()! So, sometimes shit happens...")
+		} else {
+			failure()
+		}
+		return
+	}
+
+	done()
+}
+
+func Done() {
+	done()
+}
+
+func Failure(msg ...string) {
+	m := "Uptool failed"
+	if len(msg) > 0 {
+		m = msg[0]
+	}
+	panic(m)
+}
+
+func IssuerExeIsAService(really bool) {
+	env.IssuerExeIsAService = really
+}
+
+func StopIssuerExeServiceWithin(d time.Duration) {
+	//err := exec.Command(env.IssuerExe, "stop").Run()
+	//PanicOn(err)
+}
+
+func RemoveIssuerExeWithin(d time.Duration) {
+	log.Println("Removing issuer exe")
 	start := time.Now()
 	for {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 
-		_, err := os.Stat(this.IssuerExe)
-		panicOn(err)
-		os.Remove(this.issuerExeBackup)
-		err = os.Rename(this.IssuerExe, this.issuerExeBackup)
+		_, err := os.Stat(env.IssuerExe)
+		PanicOn(err)
+		err = os.Remove(env.IssuerExeBak())
+		err = os.Rename(env.IssuerExe, env.IssuerExeBak())
 		if err == nil {
-			return true
+			log.Println("Issuer exe deleted successfuly")
+			env.IssuerExeDeleted = true
+			return
 		}
 
 		now := time.Now()
 		if now.Sub(start) >= d {
-			return false
+			panic("Issuer exe is not deleted within timeout period")
 		}
 	}
 }
 
-func (this *uptool) Success() {
-	if this.info.RunAfterUpdate {
-		err := exec.Command(this.IssuerExe).Start()
-		panicOn(err)
-	}
-	os.Remove(this.info.SelfupdateInfoFilePath)
-	os.Exit(0)
-}
-
-func (this *uptool) CopyFile(source string, dest string) (err error) {
-	sourcefile, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-
-	defer sourcefile.Close()
-
-	destfile, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-
-	defer destfile.Close()
-
-	_, err = io.Copy(destfile, sourcefile)
-	if err == nil {
-		sourceinfo, err := os.Stat(source)
-		if err != nil {
-			err = os.Chmod(dest, sourceinfo.Mode())
-		}
-
-	}
-
-	return
-}
-
-func UpTool() *uptool {
-	ut := &uptool{}
-
-	var err error
-
-	ut.selfDir, err = osext.ExecutableFolder()
-	panicOn(err)
-	ut.selfExe, err = osext.Executable()
-	panicOn(err)
-
-	ut.infoFilePath = filepath.Join(ut.selfDir, uptoolInfoFileName)
-	ut.logFilePath = filepath.Join(ut.selfDir, "uptool.log")
-
-	ut.logFile, err = os.Create(ut.logFilePath)
-	panicOn(err)
-
-	err = decodeFrom(&ut.info, ut.infoFilePath)
-	panicOn(err)
-
-	ut.issuerExeBackup = ut.info.IssuerExe + ".bak"
-
-	ut.UpdateDir = filepath.Join(ut.selfDir, "update")
-	ut.IssuerExe = ut.info.IssuerExe
-
-	return ut
-}
-
-func unzip(archivePath, targetDir string) error {
-	zipReader, err := zip.OpenReader(archivePath)
-	if err != nil {
-		return err
-	}
+func ReplaceIssuerExeWith(name string) {
+	log.Println("Replacing issuer exe with", name)
+	zipReader, err := zip.OpenReader(env.UpdateArchivePath())
+	PanicOn(err)
 	defer zipReader.Close()
 
 	for _, file := range zipReader.File {
-		filePath := filepath.Join(targetDir, file.Name)
-
-		if file.FileInfo().IsDir() {
-			os.MkdirAll(filePath, file.Mode())
-		} else {
-			reader, err := file.Open()
-			if err != nil {
-				return err
-			}
-			defer reader.Close()
-
-			fileDir, _ := filepath.Split(filePath)
-			err = os.MkdirAll(fileDir, file.Mode())
-			if err != nil {
-				return err
-			}
-
-			writer, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
-			if err != nil {
-				return err
-			}
-			defer writer.Close()
-
-			_, err = io.Copy(writer, reader)
-			if err != nil {
-				return err
-			}
+		if file.Name == name {
+			err = ExtractOne(file, env.IssuerExe)
+			PanicOn(err)
+			log.Println("Issuer exe replaced successfuly")
+			break
 		}
 	}
-
-	return nil
 }

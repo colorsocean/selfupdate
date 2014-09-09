@@ -53,6 +53,33 @@ func ExtractOne(file *zip.File, path string) error {
 	return nil
 }
 
+func CopyFile(source string, dest string) (err error) {
+	sourcefile, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+
+	defer sourcefile.Close()
+
+	destfile, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+
+	defer destfile.Close()
+
+	_, err = io.Copy(destfile, sourcefile)
+	if err == nil {
+		sourceinfo, err := os.Stat(source)
+		if err != nil {
+			err = os.Chmod(dest, sourceinfo.Mode())
+		}
+
+	}
+
+	return
+}
+
 func TrimExeExt(p string) string {
 	if runtime.GOOS == "windows" {
 		return strings.TrimSuffix(p, ".exe")
@@ -66,7 +93,7 @@ func EnsureExeExt(p string) string {
 		if strings.HasSuffix(p, ".exe") {
 			return p
 		} else {
-			return strings.TrimSuffix(p, ".exe")
+			return p + ".exe"
 		}
 	} else {
 		return p

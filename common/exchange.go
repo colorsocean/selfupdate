@@ -5,10 +5,11 @@ import "path/filepath"
 const (
 	SelfupdateInfoExt = ".selfupdate"
 
-	UpdatesCacheDirName = "updates"
+	UpdatesCacheDirName = "selfupdate"
 	UpdateArchiveName   = "update"
 	UptoolExeName       = "uptool"
 	UptoolInfoName      = "selfupdate"
+	UptoolLogName       = "uptool.log"
 )
 
 /****************************************************************
@@ -16,13 +17,22 @@ const (
 ********/
 
 type UptoolInfo struct {
-	TargetDir      string
-	IssuerExe      string
-	RunAfterUpdate bool
+	TargetDir        string
+	IssuerExe        string
+	StartAfterUpdate bool
+}
+
+func (this UptoolInfo) IssuerExeBak() string {
+	return this.IssuerExe + ".bak"
 }
 
 func (this UptoolInfo) SelfupdateInfoPath() string {
 	return TrimExeExt(this.IssuerExe) + SelfupdateInfoExt
+}
+
+func (this UptoolInfo) IssuerDir() string {
+	dir, _ := filepath.Split(this.IssuerExe)
+	return dir
 }
 
 /****************************************************************

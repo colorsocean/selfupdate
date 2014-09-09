@@ -44,7 +44,7 @@ func main() {
 
 	go func() {
 		http.HandleFunc("/update", func(w http.ResponseWriter, req *http.Request) {
-			updateFile, err := os.Open("update-2.zip")
+			updateFile, err := os.Open("update.zip")
 			if err != nil {
 				panic(err)
 			}

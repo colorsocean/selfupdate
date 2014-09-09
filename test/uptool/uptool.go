@@ -1,28 +1,17 @@
 package main
 
 import (
-	"path/filepath"
 	"time"
 
-	"github.com/colorsocean/selfupdate"
+	. "github.com/colorsocean/selfupdate/uptool"
 )
 
 func main() {
-	tool := selfupdate.UpTool()
-	tool.Log.Debugln("Uptool started")
+	defer Recover()
 
-	if !tool.WaitRemoveTarget(2 * time.Second) {
-		tool.Log.Debugln("Issuer not removed")
-		return
-	}
-	tool.Log.Debugln("Issuer removed")
-
-	err := tool.CopyFile(filepath.Join(tool.UpdateDir, "test.exe"), tool.IssuerExe)
-	if err != nil {
-		tool.Log.Debugln("Issuer not replaced", err.Error())
-		return
-	}
-	tool.Log.Debugln("Issuer replaced")
-
-	tool.Success()
+	//IssuerExeIsAService(true)
+	StopIssuerExeServiceWithin(60 * time.Second)
+	RemoveIssuerExeWithin(1 * time.Second)
+	ReplaceIssuerExeWith("test.exe")
+	Done()
 }

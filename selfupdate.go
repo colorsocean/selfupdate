@@ -11,13 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"time"
+
 	"bitbucket.org/kardianos/osext"
 
-	"github.com/Sirupsen/logrus"
 	. "github.com/colorsocean/selfupdate/common"
 )
 
@@ -27,26 +27,27 @@ var (
 	ErrNoUptoolExe = errors.New("Missing uptool executable in update archive")
 )
 
+//> Move to internal
 type SelfupdateEnv struct {
 	IssuerVersion     Version
 	MaxUpdateAttempts int
 
-	log *logrus.Logger
+	log *log.Logger
 }
 
 func (this SelfupdateEnv) IssuerExe() string {
-	exe, err = osext.Executable()
+	exe, err := osext.Executable()
 	PanicOn(err)
 	return exe
 }
 
 func (this SelfupdateEnv) IssuerDir() string {
-	dir, _ = filepath.Split(this.IssuerExe())
+	dir, _ := filepath.Split(this.IssuerExe())
 	return dir
 }
 
 func (this SelfupdateEnv) IssuerName() string {
-	_, name = filepath.Split(this.IssuerExe())
+	_, name := filepath.Split(this.IssuerExe())
 	return TrimExeExt(name)
 }
 
@@ -60,6 +61,10 @@ func (this SelfupdateEnv) TargetDir() string {
 
 func (this SelfupdateEnv) UpdatesCacheDir() string {
 	return filepath.Join(this.TargetDir(), UpdatesCacheDirName)
+}
+
+func (this SelfupdateEnv) SelfupdateLogPath() string {
+	return filepath.Join(this.UpdatesCacheDir(), this.IssuerName()+".log")
 }
 
 func (this SelfupdateEnv) UpdateDir(ver Version) string {
@@ -82,18 +87,13 @@ type Options struct {
 func Init(options Options) func() {
 	env = SelfupdateEnv{}
 
-	env.log = logrus.New()
-	env.log.Out = os.Stderr
-	env.log.Level = logrus.DebugLevel
-	env.log.Hooks.Add(&simpleLogrusHook{
-		func(entry *logrus.Entry) {
-			entry.Data["emmiter"] = "module"
-			entry.Data["name"] = "selfupdate"
-			entry.Data["pid"] = os.Getpid()
-		},
-	})
+	err := os.MkdirAll(env.UpdatesCacheDir(), 0)
+	PanicOn(err)
 
-	var err error
+	logFile, err := os.Create(env.SelfupdateLogPath())
+	PanicOn(err)
+
+	env.log = log.New(logFile, "", log.Ldate|log.Ltime|log.Lmicroseconds|log.Lshortfile)
 
 	env.IssuerVersion = options.Version
 	env.MaxUpdateAttempts = options.MaxUpdateAttempts
@@ -101,90 +101,130 @@ func Init(options Options) func() {
 		env.MaxUpdateAttempts = 3
 	}
 
+	cleanup := func() {
+		if logFile != nil {
+			logFile.Close()
+		}
+	}
+
 	if checkUpdateReady() {
+		cleanup()
 		os.Exit(0)
 	}
 
 	return func() {
+		defer cleanup()
 		checkUpdateReady()
 	}
 }
 
 func checkUpdateReady() (mustExit bool) {
-	si := &selfupdateInfo{}
-	err := DecodeFrom(si, env.SelfupdateInfoFilePath)
+	env.log.Println("Checking necessity of update")
+	si := &SelfupdateInfo{}
+	err := DecodeFrom(si, env.SelfupdateInfoPath())
 	if os.IsNotExist(err) {
+		env.log.Println("Update is not necessary")
+		return false
+	}
+	PanicOn(err)
+
+	isGreater, err := Version(si.UpdateVersion).IsGreater(env.IssuerVersion)
+	PanicOn(err)
+	if !isGreater {
+		env.log.Println("Update version is not recent")
+		cleanupSelfupdate(si)
 		return false
 	}
 
-	if si.UpdateAttempt >= env.Ops.MaxUpdateAttempts {
-		os.Remove(env.SelfupdateInfoFilePath)
+	if si.UpdateAttempt >= env.MaxUpdateAttempts {
+		env.log.Println("Reached maximum number of update attempts")
 		cleanupSelfupdate(si)
 		return false
 	}
 
 	si.UpdateAttempt++
-	err = EncodeTo(si, env.SelfupdateInfoFilePath)
+	err = EncodeTo(si, env.SelfupdateInfoPath())
 	PanicOn(err)
 
-	err = exec.Command(si.UptoolPath).Start()
+	env.log.Println("Sterting uptool")
+	err = exec.Command(si.UptoolPath()).Start()
 	PanicOn(err)
 
 	return true
 }
 
-func prepareSelfupdate(version Version, autoStart bool) (si *selfupdateInfo, f *os.File, err error) {
+func prepareSelfupdate(version Version, autoStart bool) (si *SelfupdateInfo, f *os.File, err error) {
+	env.log.Println("Preparing selfupdate")
 	si = &SelfupdateInfo{}
 	si.UpdateDir = env.UpdateDir(version)
-	si.UpdateVersion = version
-	si.IssuerVersion = env.IssuerVersion
+	si.UpdateVersion = string(version)
+	si.IssuerVersion = string(env.IssuerVersion)
 	si.StartAfterUpdate = autoStart
 
+	env.log.Println("Creating update directory")
 	err = os.MkdirAll(si.UpdateDir, 0)
 	if err != nil {
+		env.log.Println("Error creating update directory:", err.Error())
 		return nil, nil, err
 	}
 
+	env.log.Println("Creating update archive file")
 	f, err = os.Create(si.UpdateArchivePath())
 	if err != nil {
+		env.log.Println("Error creating update archive file:", err.Error())
 		return nil, nil, err
 	}
 
 	return si, f, nil
 }
 
-func continueSelfupdate(si *selfupdateInfo) error {
+func continueSelfupdate(si *SelfupdateInfo) error {
+	env.log.Println("Extracting uptool")
 	err := extractUptool(si)
 	if err != nil {
+		env.log.Println("Error extracting uptool:", err.Error())
 		return err
 	}
 
+	env.log.Println("Updating selfupdate info")
 	err = EncodeTo(si, env.SelfupdateInfoPath())
 	if err != nil {
+		env.log.Println("Error updating selfupdate info:", err.Error())
 		return err
 	}
 
 	uti := &UptoolInfo{}
-	uti.IssuerDir = env.SelfDir
-	uti.IssuerExe = env.SelfPath
-	uti.IssuerVersion = si.IssuerVersion
-	uti.UpdateVersion = si.UpdateVersion
-	uti.SelfupdateInfoFilePath = env.SelfupdateInfoFilePath
-	uti.RunAfterUpdate = si.RunAfterUpdate
+	uti.TargetDir = env.TargetDir()
+	uti.IssuerExe = env.IssuerExe()
+	uti.StartAfterUpdate = si.StartAfterUpdate
 
+	env.log.Println("Writing uptool info")
 	err = EncodeTo(uti, si.UptoolInfoPath())
 	if err != nil {
+		env.log.Println("Error writing uptool info:", err.Error())
 		return err
 	}
 
 	return nil
 }
 
-func cleanupSelfupdate(si *selfupdateInfo) error {
-	err := os.RemoveAll(si.UpdateDir)
+func cleanupSelfupdate(si *SelfupdateInfo) error {
+	return nil
+
+	err := os.Remove(env.SelfupdateInfoPath())
 	if err != nil {
+		env.log.Println("Cleanup error:", err.Error())
 		return err
 	}
+
+	env.log.Println("Selfupdate cleanup")
+	err = os.RemoveAll(si.UpdateDir)
+	if err != nil {
+		env.log.Println("Cleanup error:", err.Error())
+		return err
+	}
+
+	env.log.Println("Cleanup successful")
 	return nil
 }
 
@@ -198,8 +238,9 @@ type updateWriteCloser struct {
 }
 
 func (this *updateWriteCloser) Write(p []byte) (n int, err error) {
-	n, err = this.f.updateArchiveFile.Write(p)
+	n, err = this.f.Write(p)
 	if err != nil {
+		env.log.Println("Error writing update file:", err.Error())
 		cleanupSelfupdate(this.si)
 		return
 	}
@@ -207,14 +248,18 @@ func (this *updateWriteCloser) Write(p []byte) (n int, err error) {
 }
 
 func (this *updateWriteCloser) Close() (err error) {
-	err = this.f.updateArchiveFile.Close()
+	env.log.Println("Closing update file")
+	err = this.f.Close()
 	if err != nil {
+		env.log.Println("Error closing update file:", err.Error())
 		cleanupSelfupdate(this.si)
 		return
 	}
 
+	env.log.Println("Continuing selfupdate")
 	err = continueSelfupdate(this.si)
 	if err != nil {
+		env.log.Println("Continuing selfupdate error", err)
 		cleanupSelfupdate(this.si)
 		return
 	}
@@ -223,8 +268,10 @@ func (this *updateWriteCloser) Close() (err error) {
 }
 
 func ViaWriteCloser(version Version, autoStart bool) (io.WriteCloser, error) {
+	env.log.Println("Preparing selfupdate")
 	si, f, err := prepareSelfupdate(version, autoStart)
 	if err != nil {
+		env.log.Println("Preparing selfupdate error", err)
 		cleanupSelfupdate(si)
 		return nil, err
 	}
@@ -236,15 +283,6 @@ func ViaWriteCloser(version Version, autoStart bool) (io.WriteCloser, error) {
 ** Utils
 ********/
 
-func generateUpdateDir() string {
-	return filepath.Join(env.SelfDir, selfupdateDirName,
-		fmt.Sprintf("%s-%s", env.SelfNameNoExt, time.Now().UTC().Format(fileTsFormat)))
-}
-
-func getSelfupdateInfoFilePath() string {
-	return filepath.Join(env.SelfDir, fmt.Sprintf("%s%s", env.SelfNameNoExt, selfupdateInfoFileExt))
-}
-
 func extractUptool(si *SelfupdateInfo) error {
 	zipReader, err := zip.OpenReader(si.UpdateArchivePath())
 	if err != nil {
@@ -253,31 +291,13 @@ func extractUptool(si *SelfupdateInfo) error {
 	defer zipReader.Close()
 
 	uptoolName := EnsureExeExt(UptoolExeName)
+	env.log.Println("uptoolName:", uptoolName)
 	for _, file := range zipReader.File {
+		env.log.Println("zipfile:", file.Name)
 		if file.Name == uptoolName {
 			return ExtractOne(file, si.UptoolPath())
 		}
 	}
 
 	return ErrNoUptoolExe
-}
-
-type simpleLogrusHook struct {
-	OnFire func(*logrus.Entry)
-}
-
-func (this *simpleLogrusHook) Levels() []logrus.Level {
-	return []logrus.Level{
-		logrus.PanicLevel,
-		logrus.FatalLevel,
-		logrus.ErrorLevel,
-		logrus.WarnLevel,
-		logrus.InfoLevel,
-		logrus.DebugLevel,
-	}
-}
-
-func (this *simpleLogrusHook) Fire(entry *logrus.Entry) error {
-	this.OnFire(entry)
-	return nil
 }
